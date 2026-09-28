@@ -81,7 +81,11 @@ sync remains button-triggered by design.
 ## 9. Local development
 
 Unset `DATABASE_URL` → SQLite (`database/tracker.db`); `python app.py`.
-Simulate serverless: `VERCEL=1` (lazy init, no scheduler, tmp scratch dir).
+Simulate serverless: `VERCEL=1` (lazy init, no scheduler, tmp scratch dir)
+— but note a Vercel-mode boot **requires** a postgres `DATABASE_URL`
+(explicit fail-closed; SQLite can never initialize on Vercel's read-only
+filesystem). For `vercel dev`, set `DATABASE_URL` to Supabase (pooler string
+if the direct host is unreachable from your network).
 
 ## 10. Vercel deployment
 

@@ -46,11 +46,12 @@ class VercelLazyInitTest(unittest.TestCase):
                 # …and must not start the scheduler thread.
                 self.assertEqual(scheduler_mod._scheduler_started, started_before)
                 c = app.test_client()
+                # Vercel + SQLite is a configuration error: fail clearly (500
+                # with a logged DATABASE_URL message), never silently create
+                # an ephemeral database.
                 r = c.get('/health')
-                self.assertEqual(r.status_code, 200)
-                # First request initializes the database lazily.
-                self.assertTrue(os.path.exists(db_path))
-                self.assertEqual(r.get_json()['database'], 'sqlite')
+                self.assertEqual(r.status_code, 500)
+                self.assertFalse(os.path.exists(db_path))
         finally:
             if old is None:
                 os.environ.pop('VERCEL', None)
@@ -73,6 +74,23 @@ class ProdFailClosedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             make_app(td, ENV='production',
                      DATABASE=os.path.join(td, 'prod.db'))  # no raise: TESTING
+
+    def test_vercel_without_postgres_url_fails_clearly(self):
+        from database.db import init_db
+        old = os.environ.get('VERCEL')
+        os.environ['VERCEL'] = '1'
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                app = make_app(td)  # tmp SQLite DATABASE
+                with app.app_context():
+                    with self.assertRaises(RuntimeError) as ctx:
+                        init_db()
+                    self.assertIn('DATABASE_URL', str(ctx.exception))
+        finally:
+            if old is None:
+                os.environ.pop('VERCEL', None)
+            else:
+                os.environ['VERCEL'] = old
 
     def test_storage_unconfigured_in_production(self):
         with tempfile.TemporaryDirectory() as td:

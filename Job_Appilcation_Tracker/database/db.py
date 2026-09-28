@@ -432,6 +432,15 @@ def init_db():
     if is_postgres_url(url):
         _init_postgres(url)
     else:
+        if os.environ.get('VERCEL') == '1':
+            # Actionable log instead of a bare sqlite error: SQLite files
+            # cannot exist on Vercel's read-only filesystem, so a non-postgres
+            # DATABASE_URL there is always a configuration error.
+            raise RuntimeError(
+                'DATABASE_URL must be a postgresql:// URL (Supabase) when '
+                'running on Vercel. Set it in Vercel Dashboard → Project → '
+                'Settings → Environment Variables (Production) and redeploy.'
+            )
         _init_sqlite(url)
 
 # User Helper DB Functions
