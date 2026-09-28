@@ -17,16 +17,18 @@ INTERNET → Vercel Python Runtime → api/index.py → Flask app
 Ephemeral compute; signed-cookie sessions; per-instance rate limits;
 no threads, no disk persistence, no SQLite in prod.
 
-## 3. Root cause of FUNCTION_INVOCATION_FAILED (live 500 confirmed)
+## 3. Root cause of FUNCTION_INVOCATION_FAILED (proven via Vercel Runtime Logs)
 
-Two compounding causes, both fixed:
-1. **Import-time I/O**: `app = create_app()` ran `init_db()` at import —
-   SQLite `makedirs`+`connect` (or Postgres connect) inside a serverless
-   import crashes the function before any route runs.
-2. **Obsolete `vercel.json`** (v2 `builds`/`routes`) + no `api/index.py`
-   entry for the current Python runtime.
-Contributors if env was incomplete: silent SQLite fallback and scheduler
-startup at import. All removed/hardened (see §4).
+1. **Import-time I/O** (original 500): `app = create_app()` ran `init_db()`
+   at import — fixed by lazy per-instance init + `api/index.py`.
+2. **Missing router rewrite** (500 → router 404 `X-Vercel-Error`): fixed with
+   `"rewrites": [{"/(.*)" → "/api/index"}]`.
+3. **Missing `DATABASE_URL` at runtime** (current 500, log-proven):
+   `init_db()` → `_init_sqlite()` → `sqlite3.OperationalError: unable to open
+   database file` on the read-only FS. The function now raises instead:
+   `DATABASE_URL must be a postgresql:// URL (Supabase) when running on
+   Vercel…` — visible in Runtime Logs. Resolution is configuration (see §20),
+   not code.
 
 ## 4. Files changed
 
@@ -101,11 +103,12 @@ URI `https://job-tracker-tau-inky.vercel.app/auth/google/gmail/callback`
 
 None in this phase (model IDs fixed live-verified in the prior phase).
 
-## 14. Test results — **109/109 PASS**
+## 14. Test results — **110/110 PASS**
 
-100 prior (incl. 5 deployment) + 9 new Vercel tests: entry identity, lazy
-init (no DB file at create, created on first request), no scheduler start,
-prod DB fail-closed (+TESTING-bypass contract), prod storage 503, cron
+100 prior (incl. 5 deployment) + 10 Vercel tests: entry identity, lazy init
+with zero I/O at create, no scheduler start, prod DB fail-closed
+(+TESTING-bypass contract), Vercel+SQLite raises a clear `DATABASE_URL`
+error (the exact log-proven production path), prod storage 503, cron
 401/200/idempotent/status-secret-free/unconfigured-refusal.
 
 ## 15. Local Vercel runtime result — PASS
@@ -152,7 +155,7 @@ some networks (pooler fallback documented); local `.env` lacks DATABASE_URL.
 7. External cron (optional): daily `GET …/api/cron/reminders?key=SECRET`.
 
 IMPLEMENTED: everything above except §16/§20 live execution.
-VERIFIED LOCALLY: suite 109/109 + Vercel simulation.
+VERIFIED LOCALLY: suite 110/110 + Vercel simulation.
 VERIFIED ON VERCEL: nothing yet (awaiting redeploy).
 NOT IMPLEMENTED: nothing in scope outstanding.
 REQUIRES MANUAL CONFIGURATION: §20 steps 1-5.
