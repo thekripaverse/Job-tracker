@@ -17,8 +17,17 @@ def make_app(tmpdir, testing=False, name='sec.db'):
     db_file = os.path.join(tmpdir, name)
     cfg = {'TESTING': testing, 'DATABASE': db_file, 'SECRET_KEY': 'sec-test-key',
            'INSTANCE_PATH': os.path.join(tmpdir, 'inst')}
-    os.environ['VERCEL'] = '1'  # keep the scheduler thread out of tests
-    app = create_app(cfg)
+    # Keep the scheduler thread out of tests without leaking VERCEL globally
+    # (storage backend selection reads it per request).
+    _old_vercel = os.environ.get('VERCEL')
+    os.environ['VERCEL'] = '1'
+    try:
+        app = create_app(cfg)
+    finally:
+        if _old_vercel is None:
+            os.environ.pop('VERCEL', None)
+        else:
+            os.environ['VERCEL'] = _old_vercel
     return app
 
 

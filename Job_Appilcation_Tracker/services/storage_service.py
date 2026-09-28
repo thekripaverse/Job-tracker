@@ -226,7 +226,14 @@ def _sb_exists(path):
 # Local backend (pre-existing layout — rollback identical)
 # --------------------------------------------------------------------------
 def _local_root():
-    root = os.path.join(current_app.instance_path, 'uploads')
+    import tempfile
+    # Vercel/serverless filesystems are ephemeral (and largely read-only
+    # outside tmp): never touch instance/ there. Supabase is the persistent
+    # store; local files on serverless are per-invocation scratch only.
+    if os.environ.get('VERCEL') == '1':
+        root = os.path.join(tempfile.gettempdir(), 'job-tracker-uploads')
+    else:
+        root = os.path.join(current_app.instance_path, 'uploads')
     os.makedirs(root, exist_ok=True)
     return root
 
@@ -309,6 +316,14 @@ def upload_file(storage_path, data, content_type='application/octet-stream'):
         if status not in (200, 201):
             raise StorageError('Storage upload failed. Please try again.')
         return clean
+    # Production without Supabase Storage must fail clearly, never silently
+    # persist user files to an ephemeral disk.
+    try:
+        prod = (current_app.config.get('ENV') or '') == 'production'
+    except RuntimeError:
+        prod = os.environ.get('ENV') == 'production'
+    if prod:
+        raise StorageError('File storage is not configured on this server.')
     full = _local_fs_path(clean)
     # Local backend keeps the pre-Phase-2 avatar layout (avatars/user_<id>.<ext>)
     # so rollback to the old code serves new uploads byte-identically.

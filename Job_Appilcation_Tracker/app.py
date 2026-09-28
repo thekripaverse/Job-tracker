@@ -9,6 +9,7 @@ from routes.profile import profile_bp
 from routes.resume_versions import resume_versions_bp
 from routes.email_intelligence import email_intelligence_bp
 from routes.fit_analysis import fit_analysis_bp
+from routes.cron import cron_bp
 from services.scheduler import start_email_scheduler
 
 def create_app(config_class=Config):
@@ -26,14 +27,41 @@ def create_app(config_class=Config):
     else:
         app.config.from_object(config_class)
 
-    # Initialize database
-    with app.app_context():
-        init_db()
+    # ------------------------------------------------------------------
+    # Serverless-safe startup (Vercel): never do I/O at import time.
+    # - init_db() runs eagerly everywhere EXCEPT on Vercel, where the
+    #   filesystem may be read-only and cold starts must stay light. There it
+    #   runs once per function instance, lazily on the first request.
+    # - The background scheduler thread never starts on Vercel (see cron).
+    # ------------------------------------------------------------------
+    is_vercel = os.environ.get('VERCEL') == '1'
+
+    if app.config.get('ENV') == 'production' and not app.config.get('TESTING'):
+        # (TESTING bypass is test-only: production never sets TESTING, and
+        # TESTING already bypasses CSRF/rate-limiting by the same contract.)
+        db_cfg = (app.config.get('DATABASE') or '')
+        if not db_cfg.startswith(('postgresql://', 'postgres://')):
+            raise RuntimeError(
+                'ENV=production requires DATABASE_URL to be a postgresql:// URL '
+                '(Supabase). Refusing to silently fall back to ephemeral SQLite.'
+            )
+
+    if is_vercel:
+        @app.before_request
+        def _ensure_db_once():
+            if not app.config.get('_DB_READY'):
+                with app.app_context():
+                    init_db()
+                app.config['_DB_READY'] = True
+    else:
+        # Initialize database
+        with app.app_context():
+            init_db()
 
     # Start background email scheduler (if not testing and not on Vercel).
     # On hosting with a single worker (see render.yaml) this runs exactly once.
     # Set SCHEDULER_ENABLED=0 to disable (e.g. multi-worker or external cron).
-    is_vercel = os.environ.get('VERCEL') == '1'
+    # On Vercel the scheduler NEVER starts: use Vercel Cron → /api/cron/*.
     scheduler_on = os.environ.get('SCHEDULER_ENABLED', '1') == '1'
     if not app.config.get('TESTING') and not is_vercel and scheduler_on:
         start_email_scheduler(app)
@@ -46,6 +74,7 @@ def create_app(config_class=Config):
     app.register_blueprint(resume_versions_bp)
     app.register_blueprint(email_intelligence_bp)
     app.register_blueprint(fit_analysis_bp)
+    app.register_blueprint(cron_bp)
 
     # Always release the per-request DB connection (SQLite + Postgres).
     # Verified: get_db() caches per-request on flask.g; teardown pops and

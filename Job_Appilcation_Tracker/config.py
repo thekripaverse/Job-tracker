@@ -80,3 +80,7 @@ class Config:
     # limits so the pre-existing suite keeps exercising SQLite rollback).
     CSRF_DISABLED = os.environ.get('CSRF_DISABLED') == '1'
     RATE_LIMIT_DISABLED = os.environ.get('RATE_LIMIT_DISABLED') == '1'
+
+    # Vercel Cron / external cron secret for /api/cron/* (Bearer or ?key=).
+    # Unset = cron endpoints refuse everything (fail closed).
+    CRON_SECRET = os.environ.get('CRON_SECRET', '')

@@ -1,4 +1,9 @@
-# Deployment Guide — Render Free Tier ($0)
+# Deployment Guide
+
+> **Primary deployment is Vercel** (serverless) — see `docs/VERCEL_DEPLOYMENT.md`.
+> This file documents the **optional Render alternative** (persistent single
+> process) from the earlier phase. Both share the same Flask app, Supabase
+> Postgres, and Supabase Storage; nothing is Render-specific in app code.
 
 No real credentials appear in this document.
 

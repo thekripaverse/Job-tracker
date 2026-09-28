@@ -22,7 +22,6 @@ def make_app(tmpdir, **overrides):
     cfg = {'TESTING': True, 'DATABASE': db_file, 'SECRET_KEY': 'storage-test-key',
            'INSTANCE_PATH': inst_dir}
     cfg.update(overrides)
-    os.environ['VERCEL'] = '1'
     app = create_app(cfg)
     return app
 
