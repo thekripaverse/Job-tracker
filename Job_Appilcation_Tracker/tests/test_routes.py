@@ -254,7 +254,9 @@ class AuthAndApplicationsTestCase(unittest.TestCase):
             mock_response = mock_urlopen.return_value.__enter__.return_value
             mock_response.read.return_value = mock_html.encode('utf-8')
 
-            res = self.client.post('/api/autofill-url', json={'url': 'https://google.com/jobs/123'})
+            with patch('services.security.socket.getaddrinfo',
+                       return_value=[(2, 1, 6, '', ('142.250.72.100', 443))]):
+                res = self.client.post('/api/autofill-url', json={'url': 'https://google.com/jobs/123'})
             self.assertEqual(res.status_code, 200)
             data = res.get_json()
             self.assertTrue(data['success'])
@@ -304,7 +306,9 @@ class AuthAndApplicationsTestCase(unittest.TestCase):
             mock_response = mock_urlopen.return_value.__enter__.return_value
             mock_response.read.return_value = mock_salesforce_html.encode('utf-8')
 
-            res = self.client.post('/api/autofill-url', json={'url': 'https://salesforce.com/careers/jobs/JR337715'})
+            with patch('services.security.socket.getaddrinfo',
+                       return_value=[(2, 1, 6, '', ('96.43.144.130', 443))]):
+                res = self.client.post('/api/autofill-url', json={'url': 'https://salesforce.com/careers/jobs/JR337715'})
             self.assertEqual(res.status_code, 200)
             data = res.get_json()
             self.assertTrue(data['success'])

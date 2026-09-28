@@ -11,6 +11,7 @@ import logging
 from flask import Blueprint, request, jsonify, session
 
 from routes.auth import login_required
+from services.security import rate_limit
 from database.db import get_db, get_user_by_id
 from services.resume_context import get_active_resume
 from services.groq_service import analyze_resume_fit
@@ -22,6 +23,7 @@ fit_analysis_bp = Blueprint('fit_analysis', __name__)
 
 @fit_analysis_bp.route('/api/fit-score/analyze', methods=['POST'])
 @login_required
+@rate_limit(limit=20, window_seconds=60, key_prefix='fit_analyze')
 def analyze_fit():
     user_id = session.get('user_id')
     data = request.get_json() or {}

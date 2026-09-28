@@ -43,8 +43,7 @@ def compute_fit_score(jd_text, resume_text):
 
     models_to_try = [
         current_app.config.get('GROQ_MODEL', 'openai/gpt-oss-120b') if current_app else 'openai/gpt-oss-120b',
-        'qwen/qwen3.8-27b',
-        'groq/compound'
+        'openai/gpt-oss-20b'
     ]
 
     for model in models_to_try:
@@ -281,8 +280,7 @@ def analyze_resume_fit(resume_text, job, profile, existing_fit_score):
 
     models_to_try = [
         current_app.config.get('GROQ_MODEL', 'openai/gpt-oss-120b') if current_app else 'openai/gpt-oss-120b',
-        'qwen/qwen3.8-27b',
-        'groq/compound'
+        'openai/gpt-oss-20b'
     ]
     last_error = "AI service did not return a valid analysis."
     for model in models_to_try:

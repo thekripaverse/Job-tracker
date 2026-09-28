@@ -14,7 +14,7 @@ class ChatbotTestCase(unittest.TestCase):
             DATABASE = self.db_path
             SECRET_KEY = 'test-secret-key'
             GROQ_API_KEY = 'gsk_test_mock_key_12345'
-            GROQ_MODEL = 'qwen/qwen3.8-27b'
+            GROQ_MODEL = 'openai/gpt-oss-120b'
 
         self.app = create_app(TestConfig)
         self.client = self.app.test_client()
@@ -68,7 +68,7 @@ class ChatbotTestCase(unittest.TestCase):
             self.assertEqual(res.status_code, 200)
             data = res.get_json()
             self.assertIn('Qwen', data.get('reply', ''))
-            self.assertEqual(data.get('model'), 'qwen/qwen3.8-27b')
+            self.assertEqual(data.get('model'), 'openai/gpt-oss-120b')
 
 if __name__ == '__main__':
     unittest.main()

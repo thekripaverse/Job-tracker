@@ -1,3 +1,28 @@
+// Phase 1.5 CSRF: attach the session-bound token (rendered into
+// <meta name="csrf-token">) to every same-origin mutating fetch call.
+(function initCsrfFetch() {
+    if (window.__csrfFetchPatched) return;
+    window.__csrfFetchPatched = true;
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+        try {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+            const sameOrigin = url.startsWith('/') && !url.startsWith('//');
+            if (sameOrigin && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+                const meta = document.querySelector('meta[name="csrf-token"]');
+                const token = meta && meta.getAttribute('content');
+                if (token) {
+                    init = init || {};
+                    init.headers = new Headers(init.headers || {});
+                    if (!init.headers.has('X-CSRFToken')) init.headers.set('X-CSRFToken', token);
+                }
+            }
+        } catch (e) { /* never break requests on token lookup failure */ }
+        return nativeFetch(input, init);
+    };
+})();
+
 document.addEventListener('DOMContentLoaded', () => {
     initThemeToggle();
     initNavigationEvents();

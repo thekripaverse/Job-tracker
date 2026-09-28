@@ -6,6 +6,7 @@ import docx
 from flask import Blueprint, request, jsonify, session, g
 from werkzeug.security import generate_password_hash, check_password_hash
 from routes.auth import login_required
+from services.groq_service import compute_fit_score
 from database.db import (
     get_db, 
     get_user_by_id, 
@@ -41,10 +42,19 @@ def update_profile():
     return jsonify({'success': True, 'user': user_dict})
 
 def extract_text_from_file(file_storage):
+    from flask import current_app
     filename = file_storage.filename or ''
     ext = os.path.splitext(filename)[1].lower()
-    
+
     file_bytes = file_storage.read()
+    # Upload-size guard (Phase 1.5 P15): default 8 MB. Protects the DB/file
+    # growth path shared by master-resume upload and resume-version creation.
+    max_bytes = int(current_app.config.get('MAX_RESUME_MB', 8)) * 1024 * 1024
+    if len(file_bytes) > max_bytes:
+        raise ValueError(
+            f"File is too large ({len(file_bytes) / 1048576:.1f} MB). "
+            f"Maximum resume size is {max_bytes // 1048576} MB."
+        )
     file_stream = io.BytesIO(file_bytes)
     
     extracted_text = ''
@@ -143,28 +153,107 @@ def upload_resume():
         return jsonify({'error': 'Could not extract text from this document. If it is a PDF, please ensure it contains selectable text (not a scanned image) or try a Word (.docx) file.'}), 400
 
     db = get_db()
+    # Re-read raw bytes for binary persistence (extract_text_from_file consumes the stream).
+    try:
+        file_storage.stream.seek(0)
+        raw_binary = file_storage.stream.read()
+    except Exception:
+        raw_binary = None
+
     db.execute('UPDATE users SET resume_text = ?, resume_filename = ? WHERE id = ?', (extracted_text, filename, user_id))
     db.commit()
+
+    # Phase 2: persist the original binary alongside the extracted text.
+    # Best-effort: text is the functional core; a storage outage must not
+    # break resume upload. Status is reported explicitly.
+    storage_path, storage_error = None, None
+    if raw_binary:
+        from services import storage_service as store
+        storage_path, storage_error = store.persist_resume_binary(
+            user_id, 'master', filename, raw_binary)
+        if storage_path and 'resume_storage_path' in _user_columns(db):
+            db.execute('UPDATE users SET resume_storage_path = ? WHERE id = ?',
+                       (storage_path, user_id))
+            db.commit()
 
     # Recalculate fit scores for user applications
     apps_updated = recalculate_user_fit_scores(user_id, extracted_text)
 
-    return jsonify({
-        'success': True,
-        'filename': filename,
-        'resume_text': extracted_text,
-        'apps_updated': apps_updated
-    })
+    resp = {'success': True, 'filename': filename, 'resume_text': extracted_text,
+            'apps_updated': apps_updated}
+    if storage_path:
+        from services import storage_service as store
+        resp['storage_path'] = storage_path
+        resp['storage_backend'] = store.backend_name()
+    elif storage_error:
+        resp['storage_warning'] = storage_error
+    return jsonify(resp)
 
 @profile_bp.route('/api/resume', methods=['DELETE'])
 @login_required
 def delete_resume():
+    from services import storage_service as store
     user_id = session['user_id']
     db = get_db()
+    # Best-effort binary cleanup; text clearing always proceeds.
+    try:
+        cols = _user_columns(db)
+        user = get_user_by_id(user_id)
+        if user and 'resume_storage_path' in cols:
+            try:
+                old_path = user['resume_storage_path']
+            except (KeyError, IndexError, TypeError):
+                old_path = None
+            if old_path:
+                try:
+                    store.delete_file(old_path)
+                except store.StorageError:
+                    pass
+    except Exception:
+        pass
     db.execute('UPDATE users SET resume_text = NULL, resume_filename = NULL WHERE id = ?', (user_id,))
+    try:
+        if 'resume_storage_path' in _user_columns(db):
+            db.execute('UPDATE users SET resume_storage_path = NULL WHERE id = ?', (user_id,))
+    except Exception:
+        pass
     db.execute('UPDATE applications SET fit_score = NULL, missing_skills = NULL WHERE user_id = ?', (user_id,))
     db.commit()
     return jsonify({'success': True})
+
+
+@profile_bp.route('/api/resume/file', methods=['GET'])
+@login_required
+def download_resume():
+    """Download the owner's original master-resume binary (Phase 2).
+
+    Resumes uploaded before Phase 2 have extracted text only and no stored
+    binary → 404 with guidance. Ownership from session (no ID parameter)."""
+    from flask import Response
+    from services import storage_service as store
+    user_id = session['user_id']
+    user = get_user_by_id(user_id)
+    if not user:
+        return jsonify({'error': 'User not found.'}), 404
+    try:
+        storage_path = user['resume_storage_path']
+        filename = user['resume_filename'] or 'resume'
+    except (KeyError, IndexError, TypeError):
+        storage_path, filename = None, 'resume'
+    if not storage_path:
+        return jsonify({'error': 'No stored resume file for this account. '
+                                 'Upload a resume to download the original.'}), 404
+    try:
+        data = store.download_file(storage_path)
+    except store.StorageError as e:
+        msg = str(e).lower()
+        if 'unavailable' in msg or 'timed out' in msg or 'rejected' in msg:
+            return jsonify({'error': str(e)}), 503
+        return jsonify({'error': 'Stored resume file not found.'}), 404
+    ext = os.path.splitext(filename)[1].lower()
+    mimetype = store.RESUME_MIMETYPES.get(ext, 'application/octet-stream')
+    return Response(data, mimetype=mimetype,
+                    headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 @profile_bp.route('/api/settings', methods=['GET'])
 @login_required
@@ -219,20 +308,76 @@ def change_password():
 @login_required
 def delete_account():
     user_id = session['user_id']
+    data = request.get_json(silent=True) or request.form
+    # Explicit confirmation required: prevents accidental/CSRF-adjacent
+    # deletion and guarantees intent. Ordinary profile edits are unaffected.
+    if data.get('confirm') != 'DELETE':
+        return jsonify({'error': 'Account deletion requires explicit confirmation '
+                                 '(send {"confirm": "DELETE"}).'}), 400
+    user = get_user_by_id(user_id)
+    if not user:
+        return jsonify({'error': 'User not found.'}), 404
+    # Phase 2: remove the user's storage objects first (best-effort; a sealed
+    # account row delete must not leave orphaned private objects behind).
+    _delete_user_storage_objects(user_id)
     _remove_existing_avatars(user_id)
     delete_user_account(user_id)
     session.clear()
     return jsonify({'success': True, 'redirect': '/welcome'})
 
 
+def _delete_user_storage_objects(user_id):
+    """Best-effort cleanup of a user's Supabase/local objects on account delete."""
+    from services import storage_service as store
+    db = get_db()
+    paths = []
+    try:
+        cols = _user_columns(db)
+        user = get_user_by_id(user_id)
+        if user:
+            for key in ('avatar_storage_path', 'resume_storage_path'):
+                try:
+                    if key in cols and user[key]:
+                        paths.append(user[key])
+                except (KeyError, IndexError, TypeError):
+                    pass
+        try:
+            rows = db.execute('SELECT storage_path FROM resume_versions WHERE user_id = ?',
+                              (user_id,)).fetchall()
+            for r in rows:
+                try:
+                    if r['storage_path']:
+                        paths.append(r['storage_path'])
+                except (KeyError, IndexError, TypeError):
+                    pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    for p in paths:
+        try:
+            store.delete_file(p)
+        except Exception:
+            pass
+    try:
+        store.delete_avatar(user_id, None)
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------
 # Profile photo management (upload / replace / remove / serve).
-# Photos are stored as files under instance/uploads/avatars/ — never as
-# blobs in the users table. avatar_url holds the serving endpoint path for
-# uploaded photos (remote OAuth URLs from Google sign-in keep working).
+# Phase 2: binaries live in Supabase Storage (or the local fallback) behind
+# services.storage_service; avatar_url keeps holding the serving endpoint path
+# (API contract unchanged; remote OAuth URLs from Google sign-in unaffected).
+# users.avatar_storage_path records the storage object; NULL means legacy
+# local file under instance/uploads/avatars/ (still served as fallback).
 # --------------------------------------------------------------------------
 PHOTO_ALLOWED_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
-PHOTO_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
+PHOTO_MAX_BYTES = 2 * 1024 * 1024  # 2 MB (unchanged from Phase 1.5)
+
+# Canonical MIME map lives in services.storage_service (single source of truth).
+from services.storage_service import PHOTO_MIMETYPES
 
 
 def _avatar_dir():
@@ -251,12 +396,25 @@ def _avatar_path(user_id):
 
 
 def _remove_existing_avatars(user_id):
+    """Remove legacy local avatar files (rollback copies / pre-Phase-2)."""
     for ext in ('.png', '.jpg', '.jpeg', '.webp'):
         candidate = os.path.join(_avatar_dir(), f"user_{user_id}{ext}")
         try:
             if os.path.exists(candidate):
                 os.remove(candidate)
         except OSError:
+            pass
+
+
+def _delete_storage_avatars(user_id, keep_ext=None):
+    """Delete storage objects for all avatar exts except keep_ext (post-replace cleanup)."""
+    from services import storage_service as store
+    for ext in ('.png', '.jpg', '.jpeg', '.webp'):
+        if ext == keep_ext:
+            continue
+        try:
+            store.delete_file(store.avatar_storage_path(user_id, ext))
+        except Exception:
             pass
 
 
@@ -276,6 +434,7 @@ def _validate_image_bytes(raw):
 @profile_bp.route('/api/profile/photo', methods=['POST'])
 @login_required
 def upload_profile_photo():
+    from services import storage_service as store
     user_id = session['user_id']
     file_storage = request.files.get('photo') or request.files.get('file')
 
@@ -299,49 +458,100 @@ def upload_profile_photo():
     if not detected_ext:
         return jsonify({'error': 'This file does not appear to be a valid image.'}), 400
 
-    _remove_existing_avatars(user_id)
-    dest = os.path.join(_avatar_dir(), f"user_{user_id}{detected_ext}")
+    # Phase 2: single write through the storage abstraction (Supabase when
+    # configured, local fallback otherwise). Paths are server-generated.
+    dest = store.avatar_storage_path(user_id, detected_ext)
     try:
-        with open(dest, 'wb') as f:
-            f.write(raw)
-    except OSError as e:
-        return jsonify({'error': f'Failed to save photo: {e}'}), 500
+        store.upload_file(dest, raw, content_type=PHOTO_MIMETYPES[detected_ext])
+    except store.StorageError as e:
+        return jsonify({'error': str(e)}), 503
+    _delete_storage_avatars(user_id, keep_ext=detected_ext)
+    if store.backend_name() != 'local':
+        # Supabase is now source of truth; drop legacy local copies.
+        # On the local backend the legacy file IS the stored upload.
+        _remove_existing_avatars(user_id)
 
     avatar_path = '/api/profile/photo/file'
     db = get_db()
-    db.execute('UPDATE users SET avatar_url = ? WHERE id = ?', (avatar_path, user_id))
+    if 'avatar_storage_path' in _user_columns(db):
+        db.execute('UPDATE users SET avatar_url = ?, avatar_storage_path = ? WHERE id = ?',
+                   (avatar_path, dest, user_id))
+    else:  # legacy DB without the Phase 2 column (SQLite fallback safety)
+        db.execute('UPDATE users SET avatar_url = ? WHERE id = ?', (avatar_path, user_id))
     db.commit()
 
-    return jsonify({'success': True, 'avatar_url': avatar_path, 'size_bytes': len(raw)})
+    return jsonify({'success': True, 'avatar_url': avatar_path, 'size_bytes': len(raw),
+                    'storage_backend': store.backend_name(), 'storage_path': dest})
+
+
+def _user_columns(db):
+    try:
+        from database.db import is_postgres
+        if is_postgres():
+            rows = db.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'users'""").fetchall()
+            return {r['column_name'] for r in rows}
+        rows = db.execute('PRAGMA table_info(users)').fetchall()
+        cols = set()
+        for r in rows:
+            try:
+                cols.add(r['name'])
+            except Exception:
+                cols.add(r[1])
+        return cols
+    except Exception:
+        return set()
 
 
 @profile_bp.route('/api/profile/photo/file', methods=['GET'])
 @login_required
 def serve_profile_photo():
     from flask import Response
+    from services import storage_service as store
     user_id = session['user_id']
-    path = _avatar_path(user_id)
-    if not path:
-        return jsonify({'error': 'No profile photo found.'}), 404
-    ext = os.path.splitext(path)[1].lower()
-    mimetype = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'webp': 'image/webp'}.get(
-        ext.lstrip('.'), 'application/octet-stream')
-    # Read bytes fully instead of send_file: on Windows an open send_file
-    # handle would lock the file and break subsequent replace/remove.
+    # Ownership: only the session user's own photo (no ID parameter → no IDOR).
+    user = get_user_by_id(user_id)
+    storage_path = None
+    if user:
+        try:
+            storage_path = user['avatar_storage_path']
+        except (KeyError, IndexError, TypeError):
+            storage_path = None
     try:
-        with open(path, 'rb') as f:
-            raw = f.read()
-    except OSError:
+        raw, ext = store.read_avatar(user_id, storage_path)
+    except store.StorageError as e:
+        msg = str(e).lower()
+        if 'unavailable' in msg or 'timed out' in msg or 'rejected' in msg:
+            return jsonify({'error': str(e)}), 503
         return jsonify({'error': 'No profile photo found.'}), 404
+    mimetype = PHOTO_MIMETYPES.get(ext, 'application/octet-stream')
     return Response(raw, mimetype=mimetype, headers={'Cache-Control': 'private, max-age=3600'})
 
 
 @profile_bp.route('/api/profile/photo', methods=['DELETE'])
 @login_required
 def remove_profile_photo():
+    from services import storage_service as store
     user_id = session['user_id']
+    user = get_user_by_id(user_id)
+    storage_path = None
+    if user:
+        try:
+            storage_path = user['avatar_storage_path']
+        except (KeyError, IndexError, TypeError):
+            storage_path = None
+    # Delete the storage object first; on service failure report 503 without
+    # claiming success (metadata is kept so nothing is orphaned silently).
+    try:
+        store.delete_avatar(user_id, storage_path)
+    except store.StorageError as e:
+        return jsonify({'error': str(e)}), 503
     _remove_existing_avatars(user_id)
     db = get_db()
-    db.execute('UPDATE users SET avatar_url = NULL WHERE id = ?', (user_id,))
+    if 'avatar_storage_path' in _user_columns(db):
+        db.execute('UPDATE users SET avatar_url = NULL, avatar_storage_path = NULL WHERE id = ?', (user_id,))
+    else:
+        db.execute('UPDATE users SET avatar_url = NULL WHERE id = ?', (user_id,))
     db.commit()
     return jsonify({'success': True})

@@ -511,8 +511,7 @@ def _classify_with_ai(subject, body_text, sender_name, sender_email, api_key):
 
     models_to_try = [
         current_app.config.get('GROQ_MODEL', 'openai/gpt-oss-120b') if current_app else 'openai/gpt-oss-120b',
-        'qwen/qwen3.8-27b',
-        'groq/compound'
+        'openai/gpt-oss-20b'
     ]
 
     for model in models_to_try:

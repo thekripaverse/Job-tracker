@@ -1,5 +1,8 @@
-# Credentials and Environment Secrets
+# Credentials and Environment Secrets (never commit real values)
 .env
+*.env
+.env.*
+!.env.example
 
 # Python / Bytecode
 __pycache__/
@@ -8,8 +11,16 @@ __pycache__/
 venv/
 ENV/
 
-# Database files
+# Database files (local dev + pre-migration backups stay local)
 database/*.db
+database/*.bak
+instance/*.db
+
+# Local-only upload staging (Supabase Storage is the production store)
+instance/uploads/resumes/
+
+# Logs (may contain request details; stdout/stderr only in production)
+*.log
 
 # Pytest / Coverage
 .pytest_cache/

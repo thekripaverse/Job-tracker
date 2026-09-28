@@ -104,7 +104,11 @@ class ProfileAndSettingsTestCase(unittest.TestCase):
     def test_delete_account(self):
         self.register_and_login('victor', 'victor@example.com', 'password123')
 
-        res_del = self.client.post('/api/account/delete')
+        # Phase 1.5: explicit confirmation is required.
+        res_no_confirm = self.client.post('/api/account/delete', json={})
+        self.assertEqual(res_no_confirm.status_code, 400)
+
+        res_del = self.client.post('/api/account/delete', json={'confirm': 'DELETE'})
         self.assertEqual(res_del.status_code, 200)
         self.assertTrue(res_del.get_json()['success'])
 

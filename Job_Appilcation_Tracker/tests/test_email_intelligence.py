@@ -91,8 +91,14 @@ def test_email_intelligence_flow_authenticated(client):
     assert data['connected'] is False
     assert data['total_scanned'] == 0
 
-    # 3. Connect Gmail (dev mock redirect)
-    connect_res = client.get('/auth/google/gmail/connect', follow_redirects=True)
+    # 3. Connect Gmail (explicit dev-mock path is fail-closed by default;
+    #    Phase 1.5: create the connection directly for the flow test)
+    with client.session_transaction() as sess:
+        _flow_user_id = sess['user_id']
+    from database.db import save_email_connection as _save_conn
+    _save_conn(_flow_user_id, 'tester@example.com',
+               'dev_mock_access_token', 'dev_mock_refresh_token')
+    connect_res = client.get('/api/email-intelligence/status')
     assert connect_res.status_code == 200
 
     # 4. Check status after connect (Connected)
@@ -273,12 +279,14 @@ def test_oauth_callback_redirect_to_dashboard_html(client):
         'confirm_password': 'Password123!'
     }, follow_redirects=True)
 
-    # 1. Dev connect should redirect to HTML dashboard with view=email-intelligence
+    # 1. Unconfigured Gmail connect must fail closed (Phase 1.5): no fake
+    #    connection, redirect carries an explicit error instead.
     conn_res = client.get('/auth/google/gmail/connect', follow_redirects=False)
     assert conn_res.status_code == 302
     assert conn_res.location.startswith('/?')
     assert 'view=email-intelligence' in conn_res.location
-    assert 'connected=true' in conn_res.location
+    assert 'gmail_error=gmail_not_configured' in conn_res.location
+    assert 'connected=true' not in conn_res.location
 
     # 2. Accessing /applications?view=email-intelligence in browser should redirect to HTML dashboard
     apps_view_res = client.get('/applications?view=email-intelligence&connected=true', follow_redirects=False)

@@ -2,6 +2,7 @@ import json
 import urllib.request
 from flask import Blueprint, request, jsonify, session, current_app
 from routes.auth import login_required
+from services.security import rate_limit
 from database.db import get_db
 from routes.applications import format_application_row
 
@@ -9,6 +10,7 @@ chatbot_bp = Blueprint('chatbot', __name__)
 
 @chatbot_bp.route('/api/chat', methods=['POST'])
 @login_required
+@rate_limit(limit=30, window_seconds=60, key_prefix='chat')
 def chat():
     user_id = session.get('user_id')
     data = request.get_json() or {}
@@ -116,7 +118,7 @@ def chat():
 
     configured_model = current_app.config.get('GROQ_MODEL', 'openai/gpt-oss-120b')
     models_to_try = [configured_model]
-    for m in ['openai/gpt-oss-120b', 'qwen/qwen3.8-27b', 'groq/compound']:
+    for m in ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']:
         if m not in models_to_try:
             models_to_try.append(m)
 

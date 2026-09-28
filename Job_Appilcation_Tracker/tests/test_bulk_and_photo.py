@@ -15,6 +15,7 @@ def client(tmp_path):
         'TESTING': True,
         'DATABASE': str(db_file),
         'SECRET_KEY': 'test-bulk-key',
+        'INSTANCE_PATH': str(tmp_path / 'inst'),
     }
     app = create_app(test_config)
     with app.test_client() as c:

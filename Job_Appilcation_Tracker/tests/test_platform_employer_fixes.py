@@ -48,7 +48,10 @@ class FakeResp:
 
 
 def _parse(app_ctx, url, html):  # noqa: ANN001 - pytest helper
-    with patch('routes.applications.urllib.request.urlopen', return_value=FakeResp(html)):
+    # Hermetic DNS: resolve to a public IP so SSRF validation passes without network.
+    fake_dns = [(2, 1, 6, '', ('142.250.72.100', 443))]
+    with patch('services.security.socket.getaddrinfo', return_value=fake_dns), \
+         patch('routes.applications.urllib.request.urlopen', return_value=FakeResp(html)):
         return parse_url_job_details(url)
 
 

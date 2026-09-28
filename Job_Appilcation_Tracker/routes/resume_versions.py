@@ -29,6 +29,7 @@ def create_resume_version():
     extracted_text = None
 
     file_storage = request.files.get('resume_file') or request.files.get('file')
+    raw_binary = None
     if file_storage and file_storage.filename:
         try:
             filename, extracted_text = extract_text_from_file(file_storage)
@@ -36,20 +37,26 @@ def create_resume_version():
             return jsonify({'error': str(ve)}), 400
         except Exception as err:
             return jsonify({'error': f'Failed to process file: {str(err)}'}), 500
+        try:
+            file_storage.stream.seek(0)
+            raw_binary = file_storage.stream.read()
+        except Exception:
+            raw_binary = None
 
     db = get_db()
     # Check duplicate version name
     existing = db.execute('SELECT * FROM resume_versions WHERE user_id = ? AND LOWER(version_name) = ?', (user_id, version_name.lower())).fetchone()
-    
+
     if existing:
         existing_id = existing['id']
         if filename and extracted_text:
             db.execute('UPDATE resume_versions SET filename = ?, resume_text = ? WHERE id = ?', (filename, extracted_text, existing_id))
             db.commit()
+            _store_version_binary(db, user_id, existing_id, filename, raw_binary)
             db.execute('UPDATE users SET resume_text = ?, resume_filename = ? WHERE id = ?', (extracted_text, filename, user_id))
             db.commit()
             recalculate_user_fit_scores(user_id, extracted_text)
-            
+
         row = db.execute('SELECT * FROM resume_versions WHERE id = ?', (existing_id,)).fetchone()
         return jsonify(dict(row)), 200
 
@@ -60,8 +67,9 @@ def create_resume_version():
     db.commit()
 
     new_id = cursor.lastrowid
-    
+
     if extracted_text:
+        _store_version_binary(db, user_id, new_id, filename, raw_binary)
         db.execute('UPDATE users SET resume_text = ?, resume_filename = ? WHERE id = ?', (extracted_text, filename or version_name, user_id))
         db.commit()
         recalculate_user_fit_scores(user_id, extracted_text)
@@ -69,18 +77,100 @@ def create_resume_version():
     row = db.execute('SELECT * FROM resume_versions WHERE id = ?', (new_id,)).fetchone()
     return jsonify(dict(row)), 201
 
+
+def _version_columns(db):
+    try:
+        from database.db import is_postgres
+        if is_postgres():
+            rows = db.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'resume_versions'""").fetchall()
+            return {r['column_name'] for r in rows}
+        rows = db.execute('PRAGMA table_info(resume_versions)').fetchall()
+        cols = set()
+        for r in rows:
+            try:
+                cols.add(r['name'])
+            except Exception:
+                cols.add(r[1])
+        return cols
+    except Exception:
+        return set()
+
+
+def _store_version_binary(db, user_id, version_id, filename, raw_binary):
+    """Persist a version's original binary; best-effort (text is canonical)."""
+    if not raw_binary or not filename:
+        return
+    from services import storage_service as store
+    path, _err = store.persist_resume_binary(user_id, version_id, filename, raw_binary)
+    if path and 'storage_path' in _version_columns(db):
+        try:
+            db.execute('UPDATE resume_versions SET storage_path = ? WHERE id = ?',
+                       (path, version_id))
+            db.commit()
+        except Exception:
+            pass
+
 @resume_versions_bp.route('/api/resume-versions/<int:version_id>', methods=['DELETE'])
 @login_required
 def delete_resume_version(version_id):
+    from services import storage_service as store
     user_id = session['user_id']
     db = get_db()
     existing = db.execute('SELECT * FROM resume_versions WHERE id = ? AND user_id = ?', (version_id, user_id)).fetchone()
     if not existing:
         return jsonify({'error': 'Resume version not found'}), 404
 
+    # Best-effort binary cleanup; the row delete always proceeds.
+    try:
+        old_path = existing['storage_path']
+    except (KeyError, IndexError, TypeError):
+        old_path = None
+    if old_path:
+        try:
+            store.delete_file(old_path)
+        except store.StorageError:
+            pass
+
     db.execute('DELETE FROM resume_versions WHERE id = ? AND user_id = ?', (version_id, user_id))
     db.commit()
     return jsonify({'success': True, 'id': version_id})
+
+
+@resume_versions_bp.route('/api/resume-versions/<int:version_id>/file', methods=['GET'])
+@login_required
+def download_resume_version(version_id):
+    """Download a version's original binary (Phase 2). Ownership from session;
+    versions stored before Phase 2 have text only → 404 with guidance."""
+    from flask import Response
+    from services import storage_service as store
+    user_id = session['user_id']
+    db = get_db()
+    row = db.execute('SELECT * FROM resume_versions WHERE id = ? AND user_id = ?',
+                     (version_id, user_id)).fetchone()
+    if not row:
+        return jsonify({'error': 'Resume version not found'}), 404
+    try:
+        storage_path = row['storage_path']
+        filename = row['filename'] or row['version_name']
+    except (KeyError, IndexError, TypeError):
+        storage_path, filename = None, 'resume'
+    if not storage_path:
+        return jsonify({'error': 'No stored file for this version. '
+                                 'Re-upload it to download the original.'}), 404
+    try:
+        data = store.download_file(storage_path)
+    except store.StorageError as e:
+        msg = str(e).lower()
+        if 'unavailable' in msg or 'timed out' in msg or 'rejected' in msg:
+            return jsonify({'error': str(e)}), 503
+        return jsonify({'error': 'Stored resume file not found.'}), 404
+    import os as _os
+    mimetype = store.RESUME_MIMETYPES.get(_os.path.splitext(filename)[1].lower(),
+                                          'application/octet-stream')
+    return Response(data, mimetype=mimetype,
+                    headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 @resume_versions_bp.route('/api/fit-score/select-version', methods=['POST'])
 @login_required

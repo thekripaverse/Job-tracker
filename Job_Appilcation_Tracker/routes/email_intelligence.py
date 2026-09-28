@@ -37,6 +37,13 @@ from services.email_classifier_service import (
     match_email_to_applications,
     VALID_CLASSIFICATIONS
 )
+from services.security import (
+    consume_oauth_state,
+    decrypt_token,
+    is_mock_token,
+    new_oauth_state,
+    rate_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +57,18 @@ email_intelligence_bp = Blueprint('email_intelligence', __name__)
 def connect_gmail():
     """
     Redirects user to Google OAuth 2.0 consent screen for Gmail read-only access.
+    Fails closed when credentials are missing; dev mocks require explicit opt-in.
     """
     user_id = session.get('user_id')
     client_id = current_app.config.get('GOOGLE_CLIENT_ID')
 
     if not client_id or client_id == 'your_google_client_id_here' or client_id.startswith('YOUR_GOOGLE_CLIENT_ID'):
-        # Dev fallback: mock connection if no live credentials provided
+        # Fail closed: never fabricate a connection in production/misconfigured envs.
+        if not current_app.config.get('DEV_ALLOW_MOCKS'):
+            logger.warning(f'Gmail connect attempted without configured GOOGLE_CLIENT_ID (user {user_id})')
+            return redirect(url_for('applications.index', view='email-intelligence',
+                                    gmail_error='gmail_not_configured'))
+        # Explicit local-dev mock only (DEV_ALLOW_MOCKS=1, never production).
         save_email_connection(
             user_id=user_id,
             email_address=session.get('user_email', 'dev_candidate@gmail.com'),
@@ -66,7 +79,9 @@ def connect_gmail():
         )
         return redirect(url_for('applications.index', view='email-intelligence', connected='true'))
 
-    auth_url = get_google_auth_url(state=str(user_id))
+    # Cryptographically random, session-bound, expiring, single-use state.
+    state = new_oauth_state('gmail', ttl_seconds=current_app.config.get('OAUTH_STATE_TTL_S', 600))
+    auth_url = get_google_auth_url(state=state)
     return redirect(auth_url)
 
 @email_intelligence_bp.route('/auth/google/gmail/callback')
@@ -79,10 +94,17 @@ def gmail_callback():
     user_id = session.get('user_id')
     code = request.args.get('code')
     error = request.args.get('error')
+    state = request.args.get('state')
 
     if error or not code:
         logger.error(f"Gmail OAuth callback error: {error}")
         return redirect(url_for('applications.index', view='email-intelligence', gmail_error=error or 'oauth_failed'))
+
+    # Reject mismatched/missing/expired/replayed state before touching the code.
+    if not consume_oauth_state(state, purpose='gmail'):
+        logger.warning(f'Gmail OAuth callback with invalid state (user {user_id})')
+        return redirect(url_for('applications.index', view='email-intelligence',
+                                gmail_error='invalid_state'))
 
     try:
         token_data = exchange_code_for_tokens(code)
@@ -167,6 +189,7 @@ def disconnect_gmail():
 # --------------------------------------------------------------------------
 @email_intelligence_bp.route('/api/email-intelligence/sync', methods=['POST'])
 @login_required
+@rate_limit(limit=10, window_seconds=60, key_prefix='gmail_sync')
 def sync_emails():
     """
     Incrementally fetches career-related emails from Gmail,
@@ -183,12 +206,20 @@ def sync_emails():
             'action': 'connect'
         }), 400
 
-    access_token = conn['access_token']
-    refresh_tok = conn['refresh_token']
+    access_token = decrypt_token(conn['access_token'])
+    refresh_tok = decrypt_token(conn['refresh_token'])
     token_expiry = conn['token_expiry']
 
-    # If mock token (dev environment without live Google Cloud OAuth credentials)
-    if access_token == 'dev_mock_access_token':
+    # Mock tokens only ever work under explicit DEV_ALLOW_MOCKS; otherwise the
+    # connection is unusable and sync must fail closed, never fake success.
+    if is_mock_token(conn['access_token']):
+        if not current_app.config.get('DEV_ALLOW_MOCKS'):
+            return jsonify({
+                'success': False,
+                'error_type': 'NOT_CONNECTED',
+                'error': 'Gmail is not connected. Please connect Gmail first.',
+                'action': 'connect'
+            }), 400
         update_email_sync_timestamp(user_id)
         return jsonify({
             'success': True,

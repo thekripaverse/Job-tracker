@@ -4,6 +4,7 @@ from functools import wraps
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from database.db import get_user_by_email, get_user_by_username, get_user_by_id, get_user_by_google_id, create_user
+from services.security import rate_limit, safe_redirect_target
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -30,6 +31,7 @@ def welcome():
     return render_template('landing.html', current_user=g.user)
 
 @auth_bp.route('/login', methods=['GET', 'POST'])
+@rate_limit(limit=20, window_seconds=60, key_prefix='login')
 def login():
     if g.user:
         return redirect(url_for('applications.index'))
@@ -53,13 +55,16 @@ def login():
             else:
                 session.clear()
                 session['user_id'] = user['id']
-                next_page = request.args.get('next') or url_for('applications.index')
+                # Open-redirect fix: only local relative paths are honored.
+                raw_next = request.args.get('next')
+                next_page = safe_redirect_target(raw_next, fallback=url_for('applications.index'))
                 return redirect(next_page)
 
     google_client_id = current_app.config.get('GOOGLE_CLIENT_ID', '')
     return render_template('login.html', error=error, google_client_id=google_client_id)
 
 @auth_bp.route('/signup', methods=['GET', 'POST'])
+@rate_limit(limit=10, window_seconds=60, key_prefix='signup')
 def signup():
     if g.user:
         return redirect(url_for('applications.index'))
@@ -92,6 +97,7 @@ def signup():
     return render_template('signup.html', error=error, google_client_id=google_client_id)
 
 @auth_bp.route('/auth/google', methods=['POST'])
+@rate_limit(limit=20, window_seconds=60, key_prefix='google_auth')
 def google_auth():
     data = request.get_json() or request.form
     token = data.get('credential')
@@ -101,23 +107,23 @@ def google_auth():
 
     client_id = current_app.config.get('GOOGLE_CLIENT_ID')
 
+    # Fail closed: without a real, configured Google client ID we must never
+    # authenticate anyone — an unverified token proves nothing.
+    if not client_id or client_id.startswith('YOUR_GOOGLE_CLIENT_ID'):
+        current_app.logger.warning('Google auth attempted without a configured GOOGLE_CLIENT_ID')
+        return jsonify({'error': 'Google sign-in is not configured on this server.'}), 503
+
     try:
-        # Verify Google OAuth 2.0 ID Token
-        # If client_id is placeholder during local development, verify unverified token payload safely
-        if not client_id or client_id.startswith('YOUR_GOOGLE_CLIENT_ID'):
-            import jwt
-            # Decode token payload without signature verification for local testing with dummy token
-            id_info = jwt.decode(token, options={"verify_signature": False})
-        else:
-            id_info = id_token.verify_oauth2_token(token, google_requests.Request(), client_id)
+        # Verifies signature, audience (client ID), issuer, and expiration.
+        id_info = id_token.verify_oauth2_token(token, google_requests.Request(), client_id)
 
         google_id = id_info.get('sub')
         email = id_info.get('email', '').lower()
         name = id_info.get('name') or email.split('@')[0]
         picture = id_info.get('picture')
 
-        if not email:
-            return jsonify({'error': 'Invalid Google account email'}), 400
+        if not google_id or not email:
+            return jsonify({'error': 'Invalid Google account credentials.'}), 400
 
         # Check existing user by google_id or email
         user = get_user_by_google_id(google_id) or get_user_by_email(email)
@@ -147,8 +153,9 @@ def google_auth():
         return jsonify({'success': True, 'redirect': url_for('applications.index')})
 
     except Exception as e:
-        current_app.logger.error(f"Google auth error: {e}")
-        return jsonify({'error': f"Google login failed: {str(e)}"}), 400
+        # Never leak token/verification internals to the client.
+        current_app.logger.error(f"Google auth error: {type(e).__name__}")
+        return jsonify({'error': 'Google sign-in failed. Please try again.'}), 400
 
 @auth_bp.route('/logout')
 def logout():

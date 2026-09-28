@@ -1,0 +1,51 @@
+# Render blueprint — free $0 deployment (see docs/DEPLOYMENT.md).
+# Single 512 MB instance, ONE gunicorn worker (in-process scheduler must run once).
+services:
+  - type: web
+    name: job-tracker
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ENV
+        value: production
+      - key: DEBUG
+        value: False
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: SCHEDULER_ENABLED
+        value: 1
+      - key: SUPABASE_STORAGE_BUCKET
+        value: job-tracker-files
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      # Secrets below MUST be set in the Render Dashboard (never commit values):
+      - key: SECRET_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MAIL_SERVER
+        sync: false
+      - key: MAIL_PORT
+        sync: false
+      - key: MAIL_USERNAME
+        sync: false
+      - key: MAIL_PASSWORD
+        sync: false

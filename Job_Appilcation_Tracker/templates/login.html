@@ -4,6 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token_value }}">
     <title>Login — JobTrack</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/theme-3d.css') }}">
@@ -47,6 +48,7 @@
                     {% endif %}
 
                     <form action="{{ url_for('auth.login', next=request.args.get('next', '')) }}" method="POST">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}">
                         <div class="form-group">
                             <label for="login_input">Username or Email</label>
                             <input type="text" id="login_input" name="login_input" required

@@ -10,10 +10,14 @@ from database.db import get_db
 class FitScoreAndResumeVersionsTestCase(unittest.TestCase):
     def setUp(self):
         self.db_fd, self.db_path = tempfile.mkstemp()
+        self.inst_dir = tempfile.mkdtemp()
         self.app = create_app({
             'TESTING': True,
             'DATABASE': self.db_path,
-            'SECRET_KEY': 'test-secret-key'
+            'SECRET_KEY': 'test-secret-key',
+            # Hermetic: Groq HTTP is mocked in this file; the key only gates the call.
+            'GROQ_API_KEY': 'gsk_test_dummy_key',
+            'INSTANCE_PATH': self.inst_dir,
         })
         self.client = self.app.test_client()
         self.register_and_login('test_user', 'test_user@example.com', 'password123')
@@ -22,6 +26,11 @@ class FitScoreAndResumeVersionsTestCase(unittest.TestCase):
         os.close(self.db_fd)
         try:
             os.unlink(self.db_path)
+        except OSError:
+            pass
+        import shutil
+        try:
+            shutil.rmtree(self.inst_dir, ignore_errors=True)
         except OSError:
             pass
 

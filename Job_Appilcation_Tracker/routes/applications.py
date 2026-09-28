@@ -3,10 +3,29 @@ from datetime import datetime, date
 from database.db import get_db
 from routes.auth import login_required
 from services.email_service import send_followup_email
+from services.security import rate_limit, safe_fetch_url
 
 applications_bp = Blueprint('applications', __name__)
 
 VALID_STATUSES = ['Applied', 'Interviewing', 'Offered', 'Rejected']
+
+DATE_FMT = '%Y-%m-%d'
+
+
+def _parse_optional_date(value, field_name):
+    """Parse an optional YYYY-MM-DD date. Returns None for blank; raises
+    ValueError with a user-facing message for invalid input (never silently
+    dropped — Phase 1.5 P16)."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        datetime.strptime(text, DATE_FMT)
+    except ValueError:
+        raise ValueError(f"Invalid {field_name}: expected YYYY-MM-DD, got {text!r}.")
+    return text
 
 def calculate_days_since(val):
     if not val:
@@ -483,10 +502,8 @@ def extract_job_details_with_groq(html_content, domain="", platform=None):
     )
 
     models_to_try = [
-        current_app.config.get('GROQ_MODEL', 'qwen-2.5-32b-it'),
-        'llama-3.1-8b-instant',
-        'mixtral-8x7b-32768',
-        'gemma2-9b-it'
+        current_app.config.get('GROQ_MODEL', 'openai/gpt-oss-120b'),
+        'openai/gpt-oss-20b'
     ]
 
     for model in models_to_try:
@@ -590,12 +607,10 @@ def parse_url_job_details(url):
         pass
 
     try:
-        req = urllib.request.Request(
-            url,
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        )
-        with urllib.request.urlopen(req, timeout=5) as response:
-            html_content = response.read().decode('utf-8', errors='ignore')
+        # SSRF-hardened fetch: only public http(s) hosts, DNS-validated,
+        # 2 MB cap, 6 s timeout, no credentials forwarded.
+        html_bytes = safe_fetch_url(url, max_bytes=2 * 1024 * 1024, timeout=6)
+        html_content = html_bytes.decode('utf-8', errors='ignore')
 
         # 1. Try Groq AI Extraction first for 100% precision (platform-aware)
         ai_extracted = extract_job_details_with_groq(html_content, domain, platform)
@@ -790,7 +805,9 @@ def parse_url_job_details(url):
 
 @applications_bp.route('/api/autofill-url', methods=['POST'])
 @login_required
+@rate_limit(limit=20, window_seconds=60, key_prefix='autofill')
 def autofill_url():
+    from services.security import validate_fetch_target
     data = request.get_json() or {}
     url = data.get('url', '').strip()
     if not url:
@@ -798,6 +815,10 @@ def autofill_url():
 
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
+
+    ok, reason = validate_fetch_target(url)
+    if not ok:
+        return jsonify({'error': f'URL not allowed: {reason}'}), 400
 
     extracted = parse_url_job_details(url)
     return jsonify({
@@ -828,9 +849,12 @@ def create_application():
     date_applied = data.get('date_applied', '').strip() or date.today().strftime('%Y-%m-%d')
     notes = data.get('notes', '').strip()
     interview_date = data.get('interview_date', '').strip() or None
-    deadline_date = None
+    try:
+        deadline_date = _parse_optional_date(data.get('deadline_date'), 'deadline_date')
+        followup_date = _parse_optional_date(data.get('followup_date'), 'followup_date')
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
     assessment_date = data.get('assessment_date', '').strip() or None
-    followup_date = None
     job_url = data.get('job_url', '').strip() or None
     salary = data.get('salary', '').strip() or None
     location = data.get('location', '').strip() or None
@@ -937,13 +961,17 @@ def update_application(app_id):
     if interview_date is not None:
         interview_date = str(interview_date).strip() or None
 
-    deadline_date = None
+    try:
+        deadline_date = _parse_optional_date(
+            data.get('deadline_date', existing_dict.get('deadline_date')), 'deadline_date')
+        followup_date = _parse_optional_date(
+            data.get('followup_date', existing_dict.get('followup_date')), 'followup_date')
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
 
     assessment_date = data.get('assessment_date', existing_dict.get('assessment_date'))
     if assessment_date is not None:
         assessment_date = str(assessment_date).strip() or None
-
-    followup_date = None
 
     job_url = data.get('job_url', existing_dict.get('job_url'))
     if job_url is not None:
