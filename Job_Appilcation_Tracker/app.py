@@ -50,9 +50,17 @@ def create_app(config_class=Config):
         @app.before_request
         def _ensure_db_once():
             if not app.config.get('_DB_READY'):
-                with app.app_context():
-                    init_db()
-                app.config['_DB_READY'] = True
+                import logging as _logging
+                try:
+                    with app.app_context():
+                        init_db()
+                    app.config['_DB_READY'] = True
+                except Exception:
+                    # Log the full traceback to stderr (Vercel Runtime Logs)
+                    # and let the request fail honestly — never serve fake data.
+                    _logging.getLogger(__name__).exception(
+                        'Vercel lazy database init failed')
+                    raise
     else:
         # Initialize database
         with app.app_context():
